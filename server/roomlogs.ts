@@ -17,18 +17,20 @@ interface RoomlogOptions {
 	noLogTimes?: boolean;
 }
 
-
 interface RoomlogRow {
 	type: string;
 	roomid: string;
-	user: string | null;
+	userid: string | null;
 	time: Date;
 	log: string;
 	// tsvector, really don't use
 	content: string | null;
 }
 
-export const roomlogDB = global.Config?.replaysdb ? new PGDatabase(Config.replaysdb) : null;
+export const roomlogDB = (() => {
+	if (!global.Config || !Config.replaysdb || Config.disableroomlogdb) return null;
+	return new PGDatabase(Config.replaysdb);
+})();
 export const roomlogTable = roomlogDB?.getTable<RoomlogRow>('roomlogs');
 
 /**
@@ -78,6 +80,10 @@ export class Roomlog {
 	 * null = disabled
 	 */
 	roomlogStream?: Streams.WriteStream | null;
+	/**
+	 * Takes precedence over roomlogStream if it exists.
+	 */
+	roomlogTable: typeof roomlogTable;
 	roomlogFilename: string;
 
 	numTruncatedLines: number;
@@ -96,9 +102,7 @@ export class Roomlog {
 
 		this.numTruncatedLines = 0;
 
-		if (!Config.replaysdb) {
-			void this.setupRoomlogStream(true);
-		}
+		this.setupRoomlogStream();
 	}
 	getScrollback(channel = 0) {
 		let log = this.log;
@@ -121,43 +125,39 @@ export class Roomlog {
 		}
 		return log.join('\n') + '\n';
 	}
-	async setupRoomlogStream(sync = false) {
-		if (this.roomlogStream === null || roomlogTable) return;
-		if (!Config.logchat) {
+	setupRoomlogStream() {
+		if (this.roomlogStream === null) return;
+		if (!Config.logchat || this.roomid.startsWith('battle-') || this.roomid.startsWith('game-')) {
 			this.roomlogStream = null;
 			return;
 		}
-		if (this.roomid.startsWith('battle-')) {
+		if (roomlogTable) {
+			this.roomlogTable = roomlogTable;
 			this.roomlogStream = null;
 			return;
 		}
 		const date = new Date();
 		const dateString = Chat.toTimestamp(date).split(' ')[0];
 		const monthString = dateString.split('-', 2).join('-');
-		const basepath = `logs/chat/${this.roomid}/`;
+		const basepath = `chat/${this.roomid}/`;
 		const relpath = `${monthString}/${dateString}.txt`;
 
 		if (relpath === this.roomlogFilename) return;
 
-		if (sync) {
-			FS(basepath + monthString).mkdirpSync();
-		} else {
-			await FS(basepath + monthString).mkdirp();
-			if (this.roomlogStream === null) return;
-		}
+		Monitor.logPath(basepath + monthString).mkdirpSync();
 		this.roomlogFilename = relpath;
 		if (this.roomlogStream) void this.roomlogStream.writeEnd();
-		this.roomlogStream = FS(basepath + relpath).createAppendStream();
+		this.roomlogStream = Monitor.logPath(basepath + relpath).createAppendStream();
 		// Create a symlink to today's lobby log.
 		// These operations need to be synchronous, but it's okay
 		// because this code is only executed once every 24 hours.
 		const link0 = basepath + 'today.txt.0';
-		FS(link0).unlinkIfExistsSync();
+		Monitor.logPath(link0).unlinkIfExistsSync();
 		try {
-			FS(link0).symlinkToSync(relpath); // intentionally a relative link
-			FS(link0).renameSync(basepath + 'today.txt');
+			Monitor.logPath(link0).symlinkToSync(relpath); // intentionally a relative link
+			Monitor.logPath(link0).renameSync(basepath + 'today.txt');
 		} catch {} // OS might not support symlinks or atomic rename
-		if (!Roomlogs.rollLogTimer) void Roomlogs.rollLogs();
+		if (!Roomlogs.rollLogTimer) Roomlogs.rollLogs();
 	}
 	add(message: string) {
 		this.roomlog(message);
@@ -200,7 +200,8 @@ export class Roomlog {
 				const userid = toID(parsed.user);
 				if (userids.includes(userid)) {
 					if (!cleared.includes(userid)) cleared.push(userid);
-					if (this.roomid.startsWith('battle-')) return true; // Don't remove messages in battle rooms to preserve evidence
+					// Don't remove messages in battle rooms to preserve evidence
+					if (!this.roomlogStream && !this.roomlogTable) return true;
 					if (clearAll) return false;
 					if (lineCount > 0) {
 						lineCount--;
@@ -250,8 +251,9 @@ export class Roomlog {
 		}
 	}
 	roomlog(message: string, date = new Date()) {
-		message = message.replace(/<img[^>]* src="data:image\/png;base64,[^">]+"[^>]*>/g, '');
-		if (roomlogTable && !(!Config.logchat || this.roomid.startsWith('battle-'))) {
+		if (!Config.logchat) return;
+		message = message.replace(/<img[^>]* src="data:image\/png;base64,[^">]+"[^>]*>/g, '[img]');
+		if (this.roomlogTable) {
 			const chatData = this.parseChatLine(message);
 			const type = message.split('|')[1] || "";
 			void this.insertLog(SQL`INSERT INTO roomlogs (${{
@@ -274,9 +276,8 @@ export class Roomlog {
 		}
 	}
 	private async insertLog(query: SQLStatement, ignoreFailure = false): Promise<void> {
-		if (!roomlogTable) return;
 		try {
-			await roomlogTable.query(query);
+			await this.roomlogTable?.query(query);
 		} catch (e: any) {
 			if (e?.code === '42P01') { // table not found
 				await roomlogDB!._query(FS('databases/schemas/roomlogs.sql').readSync(), []);
@@ -292,44 +293,43 @@ export class Roomlog {
 		void Rooms.Modlog.write(this.roomid, entry, overrideID);
 	}
 	async rename(newID: RoomID): Promise<true> {
-		if (roomlogTable) {
-			await roomlogTable.updateAll({roomid: this.roomid})`WHERE roomid = ${this.roomid}`;
-			return true;
+		await Rooms.Modlog.rename(this.roomid, newID);
+		const roomlogStreamExisted = this.roomlogStream !== null;
+		await this.destroy();
+		if (this.roomlogTable) {
+			await this.roomlogTable.updateAll({roomid: newID})`WHERE roomid = ${this.roomid}`;
 		} else {
-			const roomlogPath = `logs/chat`;
-			const roomlogStreamExisted = this.roomlogStream !== null;
-			await this.destroy();
+			const roomlogPath = `chat`;
 			const [roomlogExists, newRoomlogExists] = await Promise.all([
-				FS(roomlogPath + `/${this.roomid}`).exists(),
-				FS(roomlogPath + `/${newID}`).exists(),
+				Monitor.logPath(roomlogPath + `/${this.roomid}`).exists(),
+				Monitor.logPath(roomlogPath + `/${newID}`).exists(),
 			]);
 			if (roomlogExists && !newRoomlogExists) {
-				await FS(roomlogPath + `/${this.roomid}`).rename(roomlogPath + `/${newID}`);
+				await Monitor.logPath(roomlogPath + `/${this.roomid}`).rename(Monitor.logPath(roomlogPath + `/${newID}`).path);
 			}
-			await Rooms.Modlog.rename(this.roomid, newID);
-			this.roomid = newID;
-			Roomlogs.roomlogs.set(newID, this);
 			if (roomlogStreamExisted) {
 				this.roomlogStream = undefined;
 				this.roomlogFilename = "";
-				await this.setupRoomlogStream(true);
+				this.setupRoomlogStream();
 			}
-			return true;
 		}
+		Roomlogs.roomlogs.set(newID, this);
+		this.roomid = newID;
+		return true;
 	}
-	static async rollLogs() {
+	static rollLogs() {
 		if (Roomlogs.rollLogTimer === true) return;
 		if (Roomlogs.rollLogTimer) {
 			clearTimeout(Roomlogs.rollLogTimer);
 		}
 		Roomlogs.rollLogTimer = true;
 		for (const log of Roomlogs.roomlogs.values()) {
-			await log.setupRoomlogStream();
+			log.setupRoomlogStream();
 		}
 		const time = Date.now();
 		const nextMidnight = new Date(time + 24 * 60 * 60 * 1000);
 		nextMidnight.setHours(0, 0, 1);
-		Roomlogs.rollLogTimer = setTimeout(() => void Roomlog.rollLogs(), nextMidnight.getTime() - time);
+		Roomlogs.rollLogTimer = setTimeout(() => Roomlog.rollLogs(), nextMidnight.getTime() - time);
 	}
 	truncate() {
 		if (this.noAutoTruncate) return;
