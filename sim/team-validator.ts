@@ -677,6 +677,9 @@ export class TeamValidator {
 			} else {
 				set.teraType = type.name;
 			}
+			if (dex.gen !== 9 || (ruleTable.has('terastalclause') && !ruleTable.has('bonustypemod'))) {
+				delete set.teraType;
+			}
 		}
 
 		let problem = this.checkSpecies(set, species, tierSpecies, setHas);
@@ -804,25 +807,13 @@ export class TeamValidator {
 				isFromRBYEncounter = true;
 			}
 		}
+		let isUnderleveled;
 		if (!isFromRBYEncounter && ruleTable.has('obtainablemisc')) {
 			// FIXME: Event pokemon given at a level under what it normally can be attained at gives a false positive
 			let evoSpecies = species;
 			while (evoSpecies.prevo) {
 				if (set.level < (evoSpecies.evoLevel || 0)) {
-					if (!pokemonGoProblems || (pokemonGoProblems && pokemonGoProblems.length)) {
-						problems.push(`${name} must be at least level ${evoSpecies.evoLevel} to be evolved.`);
-						if (pokemonGoProblems && pokemonGoProblems.length) {
-							problems.push(`It failed to validate as a Pokemon from Pokemon GO because:`);
-							for (const pokemonGoProblem of pokemonGoProblems) {
-								problems.push(pokemonGoProblem);
-							}
-						}
-					} else {
-						// Pokemon from Pokemon GO can be transferred to LGPE
-						setSources.isFromPokemonGo = true;
-						setSources.sources.push('8V');
-						setSources.sourcesBefore = 0;
-					}
+					isUnderleveled = evoSpecies.name;
 					break;
 				}
 				evoSpecies = dex.species.get(evoSpecies.prevo);
@@ -837,14 +828,53 @@ export class TeamValidator {
 
 		let eventOnlyData;
 
-		if (!setSources.sourcesBefore && setSources.sources.length) {
+		if ((!setSources.sourcesBefore && setSources.sources.length) || isUnderleveled) {
+			let skippedEggSource = true;
 			const legalSources = [];
+			let evoSpecies = species;
+			if (isUnderleveled && !setSources.sources.length) {
+				while (evoSpecies.prevo) {
+					const eventData = dex.species.getLearnsetData(evoSpecies.id).eventData;
+					if (eventData) {
+						for (let eventIndex = 0; eventIndex < eventData.length; eventIndex++) {
+							const eventLevel = eventData[eventIndex].level;
+							if (eventLevel && set.level >= eventLevel) {
+								setSources.sources.push(eventData[eventIndex].generation + 'S' + eventIndex + ' ' + evoSpecies.id);
+							}
+						}
+					}
+					if (evoSpecies.name === isUnderleveled) break;
+					evoSpecies = dex.species.get(evoSpecies.prevo);
+				}
+			}
 			for (const source of setSources.sources) {
+				if (isUnderleveled && source.charAt(1) !== 'S') continue;
+				if (['2E', '3E'].includes(source.substr(0, 2)) && set.level < 5) continue;
+				skippedEggSource = false;
 				if (this.validateSource(set, source, setSources, outOfBattleSpecies)) continue;
 				legalSources.push(source);
 			}
+			if (pokemonGoProblems && !pokemonGoProblems.length) {
+				if (!legalSources.length) setSources.isFromPokemonGo = true;
+				legalSources.push('8V');
+			}
 			if (legalSources.length) {
 				setSources.sources = legalSources;
+			} else if (isUnderleveled) {
+				problems.push(`${name} must be at least level ${evoSpecies.evoLevel} to be evolved.`);
+				const firstEventSource = setSources.sources.filter(source => source.charAt(1) === 'S')[0];
+				if (firstEventSource) {
+					const eventProblems = this.validateSource(
+						set, firstEventSource, setSources, outOfBattleSpecies, ` to be underleveled`
+					);
+					if (eventProblems) problems.push(...eventProblems);
+				}
+				if (pokemonGoProblems) {
+					problems.push(`It failed to validate as a Pokemon from Pokemon GO because:`);
+					for (const pokemonGoProblem of pokemonGoProblems) {
+						problems.push(pokemonGoProblem);
+					}
+				}
 			} else {
 				let nonEggSource = null;
 				for (const source of setSources.sources) {
@@ -855,8 +885,12 @@ export class TeamValidator {
 				}
 				if (!nonEggSource) {
 					// all egg moves
-					problems.push(`${name} can't get its egg move combination (${setSources.limitedEggMoves!.join(', ')}) from any possible father.`);
-					problems.push(`(Is this incorrect? If so, post the chainbreeding instructions in Bug Reports)`);
+					if (skippedEggSource) {
+						problems.push(`${name} is from a Gen 2 or 3 egg, which cannot be obtained at levels below 5.`);
+					} else {
+						problems.push(`${name} can't get its egg move combination (${setSources.limitedEggMoves!.join(', ')}) from any possible father.`);
+						problems.push(`(Is this incorrect? If so, post the chainbreeding instructions in Bug Reports)`);
+					}
 				} else {
 					if (species.id === 'mew' && pokemonGoProblems && !pokemonGoProblems.length) {
 						// Whitelist Pokemon GO Mew, which cannot be sent to Let's Go
@@ -2431,15 +2465,20 @@ export class TeamValidator {
 				}
 			}
 
-			const formeCantInherit = checkingPrevo && !originalSpecies.prevo &&
-				(!originalSpecies.changesFrom || originalSpecies.name === "Greninja-Ash");
+			let formeCantInherit = false;
+			let nextSpecies = dex.species.learnsetParent(baseSpecies);
+			while (nextSpecies) {
+				if (nextSpecies.name === species.name) break;
+				nextSpecies = dex.species.learnsetParent(nextSpecies);
+			}
+			if (checkingPrevo && !nextSpecies) formeCantInherit = true;
 			if (formeCantInherit && dex.gen < 9) break;
 
 			let sources = learnset[moveid] || [];
 			if (moveid === 'sketch') {
 				sketch = true;
 			} else if (learnset['sketch']) {
-				if (move.noSketch || move.isZ || move.isMax) {
+				if (move.flags['nosketch'] || move.isZ || move.isMax) {
 					cantLearnReason = `can't be Sketched.`;
 				} else if (move.gen > 7 && !canSketchPostGen7Moves &&
 					(dex.gen === 8 ||

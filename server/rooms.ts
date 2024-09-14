@@ -852,6 +852,12 @@ export abstract class BasicRoom {
 			}
 		}
 		this.bestOf?.setPrivacyOfGames(privacy);
+
+		if (this.game) {
+			for (const player of this.game.players) {
+				player.getUser()?.updateSearch();
+			}
+		}
 	}
 	validateSection(section: string) {
 		const target = toID(section);
@@ -1475,6 +1481,7 @@ export class GlobalRoomState {
 			if (level === 50) displayCode |= 16;
 			 // 32 was previously used for Multi Battles
 			if (format.bestOfDefault) displayCode |= 64;
+			if (format.teraPreviewDefault) displayCode |= 128;
 			this.formatList += ',' + displayCode.toString(16);
 		}
 		return this.formatList;
@@ -2115,7 +2122,7 @@ export class GameRoom extends BasicRoom {
 	}
 
 	getReplayData() {
-		if (!this.roomid.endsWith('pw')) return {id: this.roomid.slice(7)};
+		if (!this.roomid.endsWith('pw')) return {id: this.roomid.slice(7), password: null};
 		const end = this.roomid.length - 2;
 		const lastHyphen = this.roomid.lastIndexOf('-', end);
 		return {id: this.roomid.slice(7, lastHyphen), password: this.roomid.slice(lastHyphen + 1, end)};
